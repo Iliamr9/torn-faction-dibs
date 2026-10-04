@@ -3,7 +3,7 @@
 // @namespace    torn-faction-dibs
 // @version      3.0.0
 // @description  Live Torn faction-war dibs tracking with chat catch-up, target highlighting, swapping, and automatic clearing.
-// @author       Faction Tools
+// @author       Iliamr
 // @match        https://www.torn.com/*
 // @homepageURL  https://github.com/Iliamr9/torn-faction-dibs
 // @supportURL   https://github.com/Iliamr9/torn-faction-dibs/issues
