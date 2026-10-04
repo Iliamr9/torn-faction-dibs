@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Faction Dibs
 // @namespace    torn-faction-dibs
-// @version      3.0.0
+// @version      3.0.1
 // @description  Live Torn faction-war dibs tracking with chat catch-up, target highlighting, swapping, and automatic clearing.
 // @author       Iliamr
 // @match        https://www.torn.com/*
@@ -21,7 +21,7 @@
 (function () {
     'use strict';
 
-    const VERSION = '3.0.0';
+    const VERSION = '3.0.1';
     const STORAGE_KEY = 'torn_dibs_safe_state_v2';
     const API_KEY_STORAGE = 'torn_dibs_safe_api_key_v2';
     const API_BASE = 'https://api.torn.com/v2';
@@ -1003,3 +1003,352 @@
     }
 
     function ensureChatObserver() {
+        const chatBox = getFactionChatBox();
+        const root = findMessageList(chatBox);
+        if (!root || root === observedChatRoot) return;
+        try { chatObserver?.disconnect(); } catch (_) { /* ignored */ }
+        observedChatRoot = root;
+        chatObserver = new MutationObserver((mutations) => {
+            if (document.hidden) return;
+            for (const mutation of mutations) {
+                if (mutation.addedNodes?.length) {
+                    queueChatScan();
+                    break;
+                }
+            }
+        });
+        chatObserver.observe(root, { childList: true, subtree: true });
+    }
+
+    function sortMessageItemsInDomOrder(items) {
+        return Array.from(items || []).sort((a, b) => {
+            if (a === b) return 0;
+            const pos = a.compareDocumentPosition(b);
+            if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+            if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+            return 0;
+        });
+    }
+
+    // Re-read a bounded tail of faction chat. This is intentionally independent of the
+    // live MutationObserver: Torn can virtualize/recycle chat rows, so an observer can miss
+    // a message while the page is busy. The persistent message keys make this safe to run
+    // repeatedly without re-claiming already-processed dibs.
+    function scanLastFactionMessages(limit = CHAT_CATCHUP_LIMIT, { allowHidden = false } = {}) {
+        syncStateFromStorage(false);
+        try {
+            const chatBox = getFactionChatBox();
+            if (!chatBox) return 0;
+            if (!allowHidden && (document.hidden || chatBox.offsetParent === null)) return 0;
+
+            ensureChatObserver();
+            const root = findMessageList(chatBox);
+            if (!root) return 0;
+
+            const items = sortMessageItemsInDomOrder(findMessageItems(root));
+            const recent = items.slice(-Math.max(1, Number(limit) || CHAT_CATCHUP_LIMIT));
+            for (const msg of recent) processMessage(msg);
+            return recent.length;
+        } catch (err) {
+            console.warn('[Torn Dibs] recent chat scan error:', err);
+            return 0;
+        }
+    }
+
+    function scanFactionChat() {
+        if (document.hidden) return;
+        scanLastFactionMessages(CHAT_CATCHUP_LIMIT, { allowHidden: false });
+    }
+
+    function apiRequest(path) {
+        const key = getApiKey();
+        if (!key) return Promise.reject(new Error('No API key set'));
+
+        const sep = path.includes('?') ? '&' : '?';
+        const url = `${API_BASE}${path}${sep}key=${encodeURIComponent(key)}`;
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                timeout: 15000,
+                headers: { 'Accept': 'application/json' },
+                onload: (res) => {
+                    try {
+                        const data = JSON.parse(res.responseText);
+                        if (data?.error) reject(new Error(data.error.error || data.error.code || 'Torn API error'));
+                        else if (res.status < 200 || res.status >= 300) reject(new Error(`HTTP ${res.status}`));
+                        else resolve(data);
+                    } catch (err) {
+                        reject(err);
+                    }
+                },
+                onerror: () => reject(new Error('Network error')),
+                ontimeout: () => reject(new Error('API timeout'))
+            });
+        });
+    }
+
+    function attackClearsClaim(attack, claim) {
+        if (!attack || !claim) return false;
+        if (String(attack.defender?.id || '') !== String(claim.targetId)) return false;
+        const ended = Number(attack.ended || 0);
+        if (!ended || ended < Number(claim.claimedAt || 0) - 3) return false;
+
+        // is_interrupted is documented as a case where the opponent lost to somebody else
+        // before the current attacker could finish — exactly the "no matter who killed them" case.
+        return CLEAR_RESULTS.has(String(attack.result || '')) || attack.is_interrupted === true;
+    }
+
+    async function fetchAttackPage(fromTs, pageUrl) {
+        if (pageUrl) {
+            const u = new URL(pageUrl);
+            return apiRequest(`${u.pathname.replace('/v2', '')}${u.search}`);
+        }
+        return apiRequest(`/faction/attacks?filters=outgoing&limit=${API_PAGE_LIMIT}&sort=DESC&from=${Math.max(0, fromTs)}&timestamp=${nowSec()}`);
+    }
+
+    async function checkAttacks({ startup = false } = {}) {
+        if (apiCheckRunning) return;
+
+        // Before checking the attack log, re-read the latest 50 faction-chat messages.
+        // This recovers dibs that Torn's virtualized chat may have rendered without the
+        // observer seeing the insertion. Already-seen message keys prevent duplicates.
+        scanLastFactionMessages(CHAT_CATCHUP_LIMIT, { allowHidden: true });
+        syncStateFromStorage(false);
+        syncStateFromStorage(false);
+
+        const claims = allClaims();
+        if (!claims.length) {
+            lastApiError = '';
+            updatePill();
+            return;
+        }
+        if (!getApiKey()) {
+            lastApiError = 'API key required to auto-clear';
+            updatePill();
+            return;
+        }
+
+        apiCheckRunning = true;
+        try {
+            const minClaimedAt = Math.min(...claims.map(c => Number(c.claimedAt || nowSec())));
+            let nextUrl = null;
+            let page = 0;
+            const maxPages = startup ? MAX_STARTUP_PAGES : 1;
+
+            do {
+                const data = await fetchAttackPage(minClaimedAt - 5, nextUrl);
+                const attacks = Array.isArray(data?.attacks) ? data.attacks : [];
+
+                for (const claim of allClaims()) {
+                    const hit = attacks.find(a => attackClearsClaim(a, claim));
+                    if (hit) clearClaim(claim.targetId, `${hit.result || 'defeated'} at ${new Date(Number(hit.ended) * 1000).toLocaleTimeString()}`);
+                }
+
+                nextUrl = data?._metadata?.links?.next || null;
+                page++;
+            } while (startup && nextUrl && page < maxPages && allClaims().length);
+
+            lastApiError = '';
+        } catch (err) {
+            lastApiError = String(err?.message || err || 'API error');
+            console.warn('[Torn Dibs] attack check failed:', err);
+        } finally {
+            apiCheckRunning = false;
+            startupCatchupDone = true;
+            updatePill();
+            renderPanel();
+        }
+    }
+
+
+    async function checkOneClaimStatus() {
+        if (statusCheckRunning || !getApiKey()) return;
+        syncStateFromStorage(false);
+        const claims = allClaims();
+        if (!claims.length) return;
+
+        statusCursor = statusCursor % claims.length;
+        const claim = claims[statusCursor++];
+        statusCheckRunning = true;
+        try {
+            const data = await apiRequest(`/user/${encodeURIComponent(claim.targetId)}/basic?timestamp=${nowSec()}`);
+            const status = data?.profile?.status || data?.status || null;
+            const stateName = String(status?.state || '').toLowerCase();
+            if (stateName === 'hospital' || stateName === 'jail') {
+                observeClaimFallenState(claim.targetId, true, `API status: ${status.state}`);
+            } else if (stateName === 'okay') {
+                observeClaimFallenState(claim.targetId, false, 'API status: Okay');
+            }
+        } catch (err) {
+            // Public user status is a secondary check. Do not turn the whole tool red if
+            // this one lightweight request fails; faction attacks / DOM checks still work.
+            console.debug('[Torn Dibs] user status check failed:', err);
+        } finally {
+            statusCheckRunning = false;
+        }
+    }
+
+    function ensurePill() {
+        let pill = document.getElementById('torn-dibs-pill');
+        if (pill) return pill;
+        pill = document.createElement('div');
+        pill.id = 'torn-dibs-pill';
+        pill.title = 'Click for Torn Dibs settings / active claims';
+        pill.addEventListener('click', () => {
+            panelOpen = !panelOpen;
+            renderPanel();
+        });
+        document.body.appendChild(pill);
+        return pill;
+    }
+
+    function updatePill() {
+        const pill = ensurePill();
+        const count = allClaims().length;
+        const hasKey = !!getApiKey();
+        const statusClass = lastApiError ? 'bad' : hasKey ? 'ok' : 'warn';
+        const statusText = lastApiError ? 'API!' : hasKey ? 'API✓' : 'NO KEY';
+        pill.innerHTML = `DIBS ${count} · <span class="${statusClass}">${statusText}</span>`;
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '')
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function renderPanel() {
+        let panel = document.getElementById('torn-dibs-panel');
+        if (!panelOpen) {
+            panel?.remove();
+            updatePill();
+            return;
+        }
+
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.id = 'torn-dibs-panel';
+            document.body.appendChild(panel);
+        }
+
+        const claims = allClaims().sort((a, b) => Number(a.claimedAt) - Number(b.claimedAt));
+        const rows = claims.length ? claims.map(c => `
+            <div class="dib-row">
+                <b>${escapeHtml(c.targetName)}</b> [${escapeHtml(c.targetId)}]<br>
+                DIBS: <b>${escapeHtml(c.claimant)}</b>
+                <div class="muted">since ${escapeHtml(new Date(Number(c.claimedAt) * 1000).toLocaleString())}</div>
+            </div>
+        `).join('') : '<div class="muted">No active dibs.</div>';
+
+        panel.innerHTML = `
+            <h3>Torn War Dibs <span class="muted">v${VERSION}</span></h3>
+            <div class="muted">First dibs wins · new dibs swaps old target · DIBS is case-insensitive · no hold timer · attack checks re-read the latest 50 faction-chat messages.</div>
+            <label>Optional Torn API key (recommended for background clearing)</label>
+            <input id="torn-dibs-key" type="password" autocomplete="off" value="${escapeHtml(getApiKey())}" placeholder="Paste API key">
+            <button id="torn-dibs-save-key">Save key</button>
+            <button id="torn-dibs-scan-50">Scan last 50 chat messages</button>
+            <button id="torn-dibs-check-now">Check attacks now</button>
+            <button id="torn-dibs-clear-all">Clear all dibs</button>
+            ${lastApiError ? `<div class="error" style="margin-top:8px">${escapeHtml(lastApiError)}</div>` : ''}
+            <hr style="border:0;border-top:1px solid #333;margin:10px 0">
+            ${rows}
+        `;
+
+        panel.querySelector('#torn-dibs-save-key')?.addEventListener('click', () => {
+            const input = panel.querySelector('#torn-dibs-key');
+            setApiKey(input?.value || '');
+            checkAttacks({ startup: true });
+            renderPanel();
+        });
+        panel.querySelector('#torn-dibs-scan-50')?.addEventListener('click', () => {
+            const count = scanLastFactionMessages(50, { allowHidden: true });
+            console.info(`[Torn Dibs] Manual 50-message catch-up scanned ${count} loaded faction-chat messages.`);
+            renderPanel();
+            applyHighlights();
+        });
+        panel.querySelector('#torn-dibs-check-now')?.addEventListener('click', () => checkAttacks({ startup: true }));
+        panel.querySelector('#torn-dibs-clear-all')?.addEventListener('click', () => {
+            if (confirm('Clear every active dibs on this browser?')) clearAllClaims();
+        });
+    }
+
+    // localStorage is shared by Torn tabs, but JavaScript memory is not.
+    // Listen for changes made in any other tab/window and repaint immediately.
+    window.addEventListener('storage', (event) => {
+        if (event.storageArea !== localStorage || event.key !== STORAGE_KEY) return;
+        syncStateFromStorage(true, event.newValue || '');
+    });
+
+    // Torn can navigate internally without a traditional full page reload.
+    // These events make profile/list badges repaint as soon as a tab becomes active again.
+    window.addEventListener('focus', () => {
+        if (syncStateFromStorage(false)) applyHighlights();
+        scanTargets();
+        clearFallenClaimsFromDom();
+        scanFactionChat();
+        ensureChatObserver();
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (!document.hidden) {
+            syncStateFromStorage(false);
+            scanTargets();
+            scanFactionChat();
+            clearFallenClaimsFromDom();
+            ensureChatObserver();
+            applyHighlights();
+        }
+    });
+
+    function start() {
+        ensurePill();
+        scanTargets();
+        scanFactionChat();
+        ensureChatObserver();
+        clearFallenClaimsFromDom();
+        applyHighlights();
+        updatePill();
+
+        setInterval(() => {
+            try { scanFactionChat(); } catch (_) { /* keep script alive */ }
+        }, CHAT_SCAN_MS);
+
+        setInterval(() => {
+            try { scanTargets(); } catch (_) { /* keep script alive */ }
+        }, TARGET_SCAN_MS);
+
+        setInterval(() => {
+            try { clearFallenClaimsFromDom(); } catch (_) { /* keep script alive */ }
+            try { ensureChatObserver(); } catch (_) { /* keep script alive */ }
+        }, FALLEN_SCAN_MS);
+
+        setInterval(() => {
+            try { checkOneClaimStatus(); } catch (_) { /* keep script alive */ }
+        }, STATUS_CHECK_MS);
+
+        setInterval(() => {
+            if (!startupCatchupDone && allClaims().length && getApiKey()) {
+                checkAttacks({ startup: true });
+            } else {
+                checkAttacks({ startup: false });
+            }
+        }, ATTACK_CHECK_MS);
+
+        // Small delayed catch-up after Torn finishes rendering.
+        setTimeout(() => {
+            scanTargets();
+            scanFactionChat();
+            ensureChatObserver();
+            clearFallenClaimsFromDom();
+            if (allClaims().length && getApiKey()) checkAttacks({ startup: true });
+        }, 2500);
+
+        console.info(`[Torn Dibs] Safe v${VERSION} loaded.`);
+    }
+
+    start();
+})();
